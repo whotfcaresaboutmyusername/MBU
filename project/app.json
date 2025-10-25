@@ -1,0 +1,55 @@
+{
+  "expo": {
+    "entryPoint": "./App.js",
+    "name": "ChatApp",
+    "slug": "chat-app",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "scheme": "myapp",
+    "userInterfaceStyle": "automatic",
+    "newArchEnabled": true,
+    "ios": {
+      "supportsTablet": true
+    },
+    "web": {
+      "bundler": "metro",
+      "output": "single"
+    },
+    "plugins": [
+      "expo-router",
+      "expo-font",
+      "expo-web-browser"
+    ],
+    "experiments": {
+      "typedRoutes": true
+    },
+    "android": {
+      "package": "com.iipe.defcom",
+      "permissions": []
+    },
+    "cli": {
+      "version": ">= 7.0.0"
+    },
+    "build": {
+      "development": {
+        "distribution": "internal",
+        "developmentClient": true
+      },
+      "preview": {
+        "distribution": "internal"
+      },
+      "production": {
+        "android": {
+          "buildType": "apk"
+        }
+      }
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "6d345a5c-69ff-46db-a3bd-bb63802c7189"
+      }
+    },
+    "owner": "sameersri"
+  }
+}
