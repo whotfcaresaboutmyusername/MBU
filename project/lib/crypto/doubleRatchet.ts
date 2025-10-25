@@ -189,6 +189,9 @@ export class DoubleRatchet {
     };
 
     const encodedMessageKey = encode(this.sodium, messageKey);
+    if (__DEV__) {
+      console.log('[DoubleRatchet] encrypt derived message key preview:', encodedMessageKey.slice(0, 16));
+    }
     this.state.sendingMessageNumber += 1;
 
     return {
@@ -216,16 +219,33 @@ export class DoubleRatchet {
       messageKey
     );
 
+    if (!plaintext) {
+      throw new Error('Decryption failed: invalid ciphertext or key');
+    }
+
     return UTF8_DECODER.decode(plaintext);
   }
 
   async decryptIncoming(
     payload: EncryptedPayload
-  ): Promise<{ plaintext: string; messageKey: string }> {
+  ): Promise<{
+    plaintext: string;
+    messageKey: string;
+    skippedMessageKeys?: Array<{
+      ratchetKey: string;
+      messageNumber: number;
+      key: string;
+    }>;
+  }> {
     const { header } = payload;
     this.ensureRemoteKey(header);
 
     const remotePublicKey = decode(this.sodium, header.ratchetKey);
+    const skippedMessageKeys: Array<{
+      ratchetKey: string;
+      messageNumber: number;
+      key: string;
+    }> = [];
 
     if (
       !this.state.remoteRatchetKey ||
@@ -234,9 +254,26 @@ export class DoubleRatchet {
       await this.ratchetStep(remotePublicKey);
     }
 
+    if (header.messageNumber < this.state.receivingMessageNumber) {
+      throw new Error('Message number has already been processed');
+    }
+
+    while (this.state.receivingMessageNumber < header.messageNumber) {
+      const currentMessageNumber = this.state.receivingMessageNumber;
+      const { chainKey, messageKey } = await kdfChain(this.state.receivingChainKey);
+      this.state.receivingChainKey = chainKey;
+      skippedMessageKeys.push({
+        ratchetKey: header.ratchetKey,
+        messageNumber: currentMessageNumber,
+        key: encode(this.sodium, messageKey),
+      });
+      this.state.receivingMessageNumber = currentMessageNumber + 1;
+    }
+
+    const currentMessageNumber = this.state.receivingMessageNumber;
     const { chainKey, messageKey } = await kdfChain(this.state.receivingChainKey);
     this.state.receivingChainKey = chainKey;
-    this.state.receivingMessageNumber += 1;
+    this.state.receivingMessageNumber = currentMessageNumber + 1;
 
     const nonce = decode(this.sodium, header.nonce);
     const ciphertext = decode(this.sodium, payload.ciphertext);
@@ -249,9 +286,14 @@ export class DoubleRatchet {
         payload.associatedData
       );
 
+      if (__DEV__) {
+        console.log('[DoubleRatchet] decryptIncoming derived message key preview:', encode(this.sodium, messageKey).slice(0, 16));
+      }
+
       return {
         plaintext,
         messageKey: encode(this.sodium, messageKey),
+        skippedMessageKeys,
       };
     } catch (error) {
       throw new Error('Failed to decrypt message payload');

@@ -23,6 +23,7 @@ export interface StoredDeviceKeys {
   signedPreKey: KeyPair;
   signedPreKeySignature: string;
   oneTimePreKeys: KeyPair[];
+  consumedOneTimePreKeys?: KeyPair[];
   deviceLabel: string;
 }
 

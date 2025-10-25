@@ -709,7 +709,11 @@ import { useLocalSearchParams, useRouter } from 'expo-router';
 import { ArrowLeft, Phone, Video, Send } from 'lucide-react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { supabase } from '@/lib/supabase';
-import { encryptMessage, decryptMessage } from '@/lib/encryption';
+import {
+  encryptMessage,
+  decryptMessage,
+  DESTROYED_MESSAGE_PLACEHOLDER,
+} from '@/lib/encryption';
 import { useAuth } from '@/contexts/AuthContext';
 
 interface Message {
@@ -727,6 +731,9 @@ export default function ChatScreen() {
   const [newMessage, setNewMessage] = useState('');
   const [otherUser, setOtherUser] = useState<any>(null);
   const [partnerId, setPartnerId] = useState<string | null>(null);
+  const partnerIdRef = useRef<string | null>(null);
+  const otherUserRef = useRef<any>(null);
+  const messagesRef = useRef<Message[]>([]);
   const [loading, setLoading] = useState(true);
   const [sending, setSending] = useState(false);
   const [keyboardVisible, setKeyboardVisible] = useState(false);
@@ -735,6 +742,155 @@ export default function ChatScreen() {
   const router = useRouter();
   const flatListRef = useRef<FlatList>(null);
   const insets = useSafeAreaInsets();
+  const updateMessages = useCallback(
+    (updater: (prev: Message[]) => Message[]) => {
+      setMessages((prev) => {
+        const next = updater(prev);
+        messagesRef.current = next;
+        return next;
+      });
+    },
+    []
+  );
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
+
+  const mergeMessages = useCallback(
+    (existing: Message[], incoming: Message[]) => {
+      if (!existing.length) {
+        return incoming;
+      }
+
+      const messageMap = new Map<string, Message>();
+      for (const message of existing) {
+        messageMap.set(message.id, message);
+      }
+
+      for (const message of incoming) {
+        const current = messageMap.get(message.id);
+        if (
+          current &&
+          current.content !== DESTROYED_MESSAGE_PLACEHOLDER &&
+          message.content === DESTROYED_MESSAGE_PLACEHOLDER
+        ) {
+          messageMap.set(message.id, {
+            ...message,
+            content: current.content,
+          });
+        } else {
+          messageMap.set(message.id, message);
+        }
+      }
+
+      return Array.from(messageMap.values()).sort(
+        (a, b) =>
+          new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+      );
+    },
+    []
+  );
+
+  const markMessagesAsRead = useCallback(
+    async (messageIds: string[]) => {
+      if (!messageIds.length) {
+        return;
+      }
+
+      const uniqueUnreadIds = Array.from(new Set(messageIds)).filter(Boolean);
+      if (!uniqueUnreadIds.length) {
+        return;
+      }
+
+      updateMessages((prev) =>
+        prev.map((message) =>
+          uniqueUnreadIds.includes(message.id) ? { ...message, read: true } : message
+        )
+      );
+
+      try {
+        await supabase
+          .from('messages')
+          .update({ read: true })
+          .in('id', uniqueUnreadIds);
+      } catch (error) {
+        console.error('[markMessagesAsRead] Failed to update read status:', error);
+      }
+
+      try {
+        await supabase
+          .from('messages')
+          .delete()
+          .in('id', uniqueUnreadIds);
+      } catch (error) {
+        console.error('[markMessagesAsRead] Failed to delete messages:', error);
+      }
+    },
+    [updateMessages]
+  );
+  useEffect(() => {
+    partnerIdRef.current = partnerId;
+  }, [partnerId]);
+  useEffect(() => {
+    otherUserRef.current = otherUser;
+  }, [otherUser]);
+
+  useEffect(() => {
+    if (!session?.user?.id) {
+      return;
+    }
+
+    const unreadIds = messages
+      .filter(
+        (message) =>
+          message.sender_id !== session.user.id && !message.read
+      )
+      .map((message) => message.id);
+
+    if (unreadIds.length) {
+      markMessagesAsRead(unreadIds);
+    }
+  }, [messages, session?.user?.id, markMessagesAsRead]);
+
+  const ensurePartnerDetails = useCallback(async () => {
+    if (!session?.user || !id) {
+      return;
+    }
+
+    if (partnerIdRef.current && otherUserRef.current?.id) {
+      return;
+    }
+
+    const { data: participants } = await supabase
+      .from('conversation_participants')
+      .select('user_id')
+      .eq('conversation_id', id)
+      .neq('user_id', session.user.id)
+      .limit(1)
+      .maybeSingle();
+
+    if (!participants?.user_id) {
+      return;
+    }
+
+    if (!partnerIdRef.current) {
+      partnerIdRef.current = participants.user_id;
+      setPartnerId(participants.user_id);
+    }
+
+    if (!otherUserRef.current?.id) {
+      const { data: user } = await supabase
+        .from('profiles')
+        .select('*')
+        .eq('id', participants.user_id)
+        .single();
+
+      if (user) {
+        otherUserRef.current = user;
+        setOtherUser(user);
+      }
+    }
+  }, [session?.user?.id, id]);
   const keyboardShowEvent: KeyboardEventName =
     Platform.OS === 'ios' ? 'keyboardWillShow' : 'keyboardDidShow';
   const keyboardHideEvent: KeyboardEventName =
@@ -797,28 +953,49 @@ export default function ChatScreen() {
             const incoming = payload.new as Message;
             const remoteUserId =
               incoming.sender_id === session.user.id
-                ? partnerId ?? otherUser?.id ?? ''
+                ? partnerIdRef.current ?? otherUserRef.current?.id ?? ''
                 : incoming.sender_id;
 
-            const decryptedContent =
-              remoteUserId.length === 0
-                ? '[encrypted]'
-                : await decryptMessage(
-                    incoming.ciphertext || incoming.content,
-                    {
-                      conversationId: id,
-                      localUserId: session.user.id,
-                      remoteUserId,
-                      senderIsLocal: incoming.sender_id === session.user.id,
-                    }
-                  );
+            let decryptedContent = '[encrypted]';
+            if (remoteUserId.length > 0) {
+              try {
+                decryptedContent = await decryptMessage(
+                  incoming.ciphertext || incoming.content,
+                  {
+                    conversationId: id,
+                    localUserId: session.user.id,
+                    remoteUserId,
+                    senderIsLocal: incoming.sender_id === session.user.id,
+                  }
+                );
+              } catch {
+                console.info('[Realtime] Message could not be decrypted, marking destroyed:', {
+                  messageId: incoming.id,
+                });
+                decryptedContent = DESTROYED_MESSAGE_PLACEHOLDER;
+              }
+            }
 
-            const newMsg = {
+            const existingMessage = messagesRef.current.find(
+              (msg) => msg.id === incoming.id
+            );
+            const newMsg: Message = {
               ...incoming,
-              content: decryptedContent,
+              content:
+                decryptedContent === DESTROYED_MESSAGE_PLACEHOLDER &&
+                existingMessage &&
+                existingMessage.content !== DESTROYED_MESSAGE_PLACEHOLDER
+                  ? existingMessage.content
+                  : decryptedContent,
             };
 
-            setMessages((prev) => [...prev, newMsg]);
+            updateMessages((prev) => {
+              const alreadyExists = prev.some((msg) => msg.id === newMsg.id);
+              if (alreadyExists) {
+                return prev.map((msg) => (msg.id === newMsg.id ? newMsg : msg));
+              }
+              return [...prev, newMsg];
+            });
 
             if (incoming.sender_id !== session.user.id && !incoming.read) {
               await supabase
@@ -838,7 +1015,7 @@ export default function ChatScreen() {
           },
           (payload) => {
             const updated = payload.new as Message;
-            setMessages((prev) =>
+            updateMessages((prev) =>
               prev.map((msg) => (msg.id === updated.id ? { ...msg, read: updated.read } : msg))
             );
           }
@@ -849,9 +1026,11 @@ export default function ChatScreen() {
         supabase.removeChannel(channel);
       };
     }
-  }, [session, id, partnerId, otherUser]);
+  }, [session?.user?.id, id]);
 
-  const loadChatData = async () => {
+  const loadChatData = async (options: { preserveRecent?: boolean } = {}) => {
+    const preserveRecent = options.preserveRecent ?? false;
+
     if (!session?.user || !id) return;
 
     const { data: participants } = await supabase
@@ -864,6 +1043,7 @@ export default function ChatScreen() {
 
     if (participants) {
       if (participants.user_id) {
+        partnerIdRef.current = participants.user_id;
         setPartnerId(participants.user_id);
       }
       const { data: user } = await supabase
@@ -872,6 +1052,9 @@ export default function ChatScreen() {
         .eq('id', participants.user_id)
         .single();
 
+      if (user) {
+        otherUserRef.current = user;
+      }
       setOtherUser(user);
     }
 
@@ -883,37 +1066,94 @@ export default function ChatScreen() {
 
     if (messagesData) {
       const resolvedPartnerId =
-        participants?.user_id ?? partnerId ?? otherUser?.id ?? '';
-      const decrypted = await Promise.all(
-        (messagesData as any[]).map(async (raw) => {
+        participants?.user_id ??
+        partnerIdRef.current ??
+        otherUserRef.current?.id ??
+        '';
+      
+      // Decrypt messages SEQUENTIALLY to maintain ratchet state consistency
+      const decrypted: Message[] = [];
+      console.log(`[loadChatData] Decrypting ${messagesData.length} messages sequentially...`);
+      
+      for (const raw of messagesData as any[]) {
+        const existingMessage = messagesRef.current.find(
+          (msg) => msg.id === raw.id
+        );
+
+        try {
           const ciphertext =
             typeof raw?.ciphertext === 'string' && raw.ciphertext.length > 0
               ? raw.ciphertext
               : raw?.content ?? '';
+          if (__DEV__ && typeof ciphertext === 'string') {
+            console.log('[loadChatData] Ciphertext preview:', ciphertext.slice(0, 64));
+          }
           const isLocalSender = raw?.sender_id === session.user.id;
           const remoteUserId = isLocalSender
             ? resolvedPartnerId
             : raw?.sender_id ?? resolvedPartnerId;
 
+          console.log('[loadChatData] Decrypting message:', {
+            messageId: raw.id,
+            isLocalSender,
+            hasResolvedPartner: !!resolvedPartnerId,
+            remoteUserId,
+            hasCiphertext: !!ciphertext && ciphertext !== '[encrypted]',
+          });
+
           if (!remoteUserId) {
-            return {
+            console.warn('[loadChatData] No remote user ID, showing as encrypted');
+            decrypted.push({
               ...(raw as Message),
               content: '[encrypted]',
-            } as Message;
+            } as Message);
+            continue;
           }
 
-          return {
+          const decryptedContent = await decryptMessage(ciphertext, {
+            conversationId: id,
+            localUserId: session.user.id,
+            remoteUserId,
+            senderIsLocal: isLocalSender,
+          });
+
+          console.log('[loadChatData] Message decrypted successfully:', raw.id);
+          decrypted.push({
             ...(raw as Message),
-            content: await decryptMessage(ciphertext, {
-              conversationId: id,
-              localUserId: session.user.id,
-              remoteUserId,
-              senderIsLocal: isLocalSender,
-            }),
-          } as Message;
-        })
+            content: decryptedContent,
+          } as Message);
+        } catch {
+          console.info('[loadChatData] Message could not be decrypted, marking destroyed:', {
+            messageId: raw.id,
+          });
+
+          if (
+            preserveRecent &&
+            existingMessage &&
+            existingMessage.content !== DESTROYED_MESSAGE_PLACEHOLDER
+          ) {
+            decrypted.push({
+              ...(raw as Message),
+              content: existingMessage.content,
+            } as Message);
+          } else {
+            decrypted.push({
+              ...(raw as Message),
+              content: DESTROYED_MESSAGE_PLACEHOLDER,
+            } as Message);
+          }
+        }
+      }
+      
+      console.log(
+        `[loadChatData] Decryption complete: ${
+          decrypted.filter((m) => !m.content.startsWith('[')).length
+        }/${decrypted.length} successful`
       );
-      setMessages(decrypted);
+      const mergedMessages = preserveRecent
+        ? mergeMessages(messagesRef.current, decrypted)
+        : decrypted;
+      updateMessages(() => mergedMessages);
 
       const unreadMessages = decrypted.filter(
         (msg) => msg.sender_id !== session.user.id && !msg.read
@@ -933,20 +1173,45 @@ export default function ChatScreen() {
     setLoading(false);
   };
 
-  const sendMessage = async () => {
-    if (!newMessage.trim() || !session?.user || !id) return;
-
-    if (!otherUser?.id) {
-      await loadChatData();
+  useEffect(() => {
+    if (!session?.user || !id) {
+      return;
     }
 
-    const recipientId = partnerId ?? otherUser?.id ?? null;
+    const poller = setInterval(() => {
+      loadChatData({ preserveRecent: true });
+    }, 5000);
+
+    return () => clearInterval(poller);
+  }, [session?.user?.id, id]);
+
+  const sendMessage = async () => {
+    console.log('[sendMessage] Starting...');
+    
+    if (!newMessage.trim() || !session?.user || !id) {
+      console.log('[sendMessage] Validation failed:', { 
+        hasMessage: !!newMessage.trim(), 
+        hasSession: !!session?.user, 
+        hasId: !!id 
+      });
+      return;
+    }
+
+    if (!otherUserRef.current?.id) {
+      console.log('[sendMessage] Ensuring partner details are loaded...');
+      await ensurePartnerDetails();
+    }
+
+    const recipientId =
+      partnerIdRef.current ?? otherUserRef.current?.id ?? null;
 
     if (!recipientId) {
+      console.log('[sendMessage] No recipient found');
       Alert.alert('Error', 'Unable to determine the recipient for this chat.');
       return;
     }
 
+    console.log('[sendMessage] Recipient ID:', recipientId);
     setSending(true);
     const messageContent = newMessage.trim();
     setNewMessage('');
@@ -954,12 +1219,15 @@ export default function ChatScreen() {
     let signalMetadata: Record<string, any> | null = null;
 
     try {
+      console.log('[sendMessage] Encrypting message...');
       encryptedContent = await encryptMessage(messageContent, {
         conversationId: id,
         localUserId: session.user.id,
         remoteUserId: recipientId,
         associatedData: id,
       });
+      console.log('[sendMessage] Message encrypted successfully');
+      
       try {
         const parsed = JSON.parse(encryptedContent);
         if (parsed && typeof parsed === 'object') {
@@ -971,15 +1239,15 @@ export default function ChatScreen() {
     } catch (error: any) {
       setSending(false);
       setNewMessage(messageContent);
-      console.error('[chat] Failed to encrypt message', error);
+      console.error('[sendMessage] Encryption failed:', error);
       Alert.alert(
         'Encryption error',
-        error?.message || 'Failed to encrypt message payload.'
+        `Failed to encrypt: ${error?.message || 'Unknown error'}\n\nPlease check console for details.`
       );
       return;
     }
 
-    const baseMessagePayload: Record<string, any> = {
+    const messagePayload = {
       conversation_id: id,
       sender_id: session.user.id,
       content: '[encrypted]',
@@ -989,62 +1257,41 @@ export default function ChatScreen() {
     };
 
     try {
-      const attemptInsert = async (payload: Record<string, any>) => {
-        const { error } = await supabase.from('messages').insert(payload);
-        if (error) {
-          throw error;
-        }
-      };
+      console.log('[sendMessage] Inserting message to database...');
+      const { data, error } = await supabase
+        .from('messages')
+        .insert(messagePayload)
+        .select();
 
-      const payloadAttempts: Record<string, any>[] = [
-        {
-          ...baseMessagePayload,
-          sender: session.user.id,
-          recipient: otherUser.id,
-        },
-        { ...baseMessagePayload },
-        (() => {
-          const fallbackPayload: Record<string, any> = {
-            ...baseMessagePayload,
-            content: encryptedContent,
-          };
-          delete fallbackPayload.ciphertext;
-          return fallbackPayload;
-        })(),
-      ];
-
-      let lastError: any = null;
-      let sent = false;
-
-      for (const payload of payloadAttempts) {
-        try {
-          await attemptInsert(payload);
-          sent = true;
-          break;
-        } catch (error) {
-          lastError = error;
-        }
+      if (error) {
+        console.error('[sendMessage] Database insert error:', error);
+        throw error;
       }
 
-      if (!sent && lastError) {
-        throw lastError;
-      }
+      console.log('[sendMessage] Message inserted successfully:', data);
 
+      // Update conversation timestamp
       const { error: updateError } = await supabase
         .from('conversations')
         .update({ updated_at: new Date().toISOString() })
         .eq('id', id);
 
       if (updateError) {
-        throw updateError;
+        console.error('[sendMessage] Conversation update error:', updateError);
+        // Don't throw - message was sent successfully
       }
+
+      await loadChatData({ preserveRecent: true });
+      console.log('[sendMessage] Message sent successfully!');
     } catch (error: any) {
       setNewMessage(messageContent);
-      console.error('[chat] Failed to send message', error);
+      setSending(false);
+      console.error('[sendMessage] Failed to send message:', error);
       Alert.alert(
-        'Error',
-        error?.message || 'Failed to send message. Please try again.'
+        'Send Failed',
+        `Error: ${error?.message || 'Unknown error'}\n\nDetails: ${JSON.stringify(error, null, 2)}`
       );
+      return;
     } finally {
       setSending(false);
     }
@@ -1052,6 +1299,7 @@ export default function ChatScreen() {
 
   const renderMessage = ({ item }: { item: Message }) => {
     const isOwnMessage = item.sender_id === session?.user.id;
+    const isDestroyed = item.content === DESTROYED_MESSAGE_PLACEHOLDER;
 
     return (
       <View
@@ -1070,9 +1318,10 @@ export default function ChatScreen() {
             style={[
               styles.messageText,
               isOwnMessage ? styles.ownText : styles.otherText,
+              isDestroyed && styles.destroyedText,
             ]}
           >
-            {item.content}
+            {isDestroyed ? 'Message destroyed' : item.content}
           </Text>
           <View style={styles.messageFooter}>
             <Text
@@ -1316,6 +1565,10 @@ const styles = StyleSheet.create({
     fontSize: 16,
     lineHeight: 20,
     marginBottom: 4,
+  },
+  destroyedText: {
+    fontStyle: 'italic',
+    color: '#9e9e9e',
   },
   ownText: {
     color: '#000',

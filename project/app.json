@@ -1,10 +1,11 @@
 {
   "expo": {
     "entryPoint": "./App.js",
-    "name": "ChatApp",
-    "slug": "chat-app",
+    "name": "Defcom",
+    "slug": "Defcom",
     "version": "1.0.0",
     "orientation": "portrait",
+    "icon": "./assets/images/icon.png",
     "scheme": "myapp",
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
@@ -47,9 +48,9 @@
     "extra": {
       "router": {},
       "eas": {
-        "projectId": "6d345a5c-69ff-46db-a3bd-bb63802c7189"
+        "projectId": "f4a7e512-d64e-4c7f-9071-398a7cecd328"
       }
     },
-    "owner": "sameersri"
+    "owner": "dk0713"
   }
 }

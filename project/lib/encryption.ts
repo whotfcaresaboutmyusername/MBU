@@ -5,6 +5,7 @@ import {
 } from './crypto/deviceKeys';
 import { DoubleRatchet } from './crypto/doubleRatchet';
 import {
+  deleteSession,
   loadDeviceKeys,
   loadSession,
   saveDeviceKeys,
@@ -15,6 +16,7 @@ import {
   performX3DHInitiation,
 } from './crypto/x3dh';
 import type { RatchetHeader, SessionState } from './crypto/types';
+import { trackTelemetryEvent } from './telemetry';
 
 interface SessionContext {
   conversationId: string;
@@ -33,6 +35,8 @@ export interface DecryptionOptions extends SessionContext {
 interface SignalHandshakeMetadata {
   oneTimePreKeyId?: string;
   oneTimePreKey?: string;
+  senderIdentityKey?: string;
+  senderDeviceLabel?: string;
 }
 
 export interface SignalEnvelope {
@@ -48,6 +52,8 @@ const MESSAGE_KEY_CACHE_LIMIT = 128;
 
 const serialize = (value: SignalEnvelope): string =>
   JSON.stringify(value);
+
+export const DESTROYED_MESSAGE_PLACEHOLDER = '[destroyed]';
 
 export const parseEnvelope = (payload: string): SignalEnvelope | null => {
   try {
@@ -94,96 +100,158 @@ export async function encryptMessage(
   plaintext: string,
   options: EncryptionOptions
 ): Promise<string> {
+  console.log('[encryptMessage] Starting encryption...');
+  
   if (!plaintext) {
+    console.log('[encryptMessage] Empty plaintext, returning empty string');
     return '';
   }
 
   const { conversationId, localUserId, remoteUserId, associatedData } = options;
+  console.log('[encryptMessage] Options:', { conversationId, localUserId, remoteUserId });
+  
+  console.log('[encryptMessage] Ensuring device keys...');
   const localKeys = await ensureDeviceKeys(localUserId);
+  console.log('[encryptMessage] Device keys loaded');
+  
+  console.log('[encryptMessage] Loading session...');
   let session = await loadSession(conversationId);
   let handshakeMeta: SignalHandshakeMetadata | undefined;
   let isNewSession = false;
+  
+  console.log('[encryptMessage] Session loaded:', session ? 'exists' : 'null');
 
   if (!session || session.partnerId !== remoteUserId) {
-    const remote = await fetchRemoteDeviceBundle(remoteUserId);
-    if (!remote) {
-      throw new Error('Remote contact is missing Signal key material');
+    console.log('[encryptMessage] Creating new session, fetching remote bundle...');
+    try {
+      const remote = await fetchRemoteDeviceBundle(remoteUserId);
+      if (!remote) {
+        throw new Error('Remote contact is missing Signal key material');
+      }
+      console.log('[encryptMessage] Remote bundle fetched successfully');
+
+      console.log('[encryptMessage] Performing X3DH initiation...');
+      const handshake = await performX3DHInitiation({
+        localKeys,
+        remoteBundle: remote.bundle,
+        remoteOneTimePreKey: remote.oneTimePreKey
+          ? {
+              id: remote.oneTimePreKeyId,
+              publicKey: remote.oneTimePreKey,
+            }
+          : undefined,
+      });
+      console.log('[encryptMessage] X3DH handshake completed');
+
+      if (remote.oneTimePreKeyId) {
+        await markPreKeyConsumed(remote.oneTimePreKeyId);
+      }
+
+      const handshakeSeed: SignalHandshakeMetadata = {
+        senderIdentityKey: localKeys.identityKey.publicKey,
+        senderDeviceLabel: localKeys.deviceLabel,
+      };
+
+      if (remote.oneTimePreKey && remote.oneTimePreKeyId) {
+        handshakeSeed.oneTimePreKeyId = remote.oneTimePreKeyId;
+        handshakeSeed.oneTimePreKey = remote.oneTimePreKey;
+      }
+
+      session = createSession(
+        { conversationId, localUserId, remoteUserId },
+        handshake.ratchetState,
+        remote.oneTimePreKey
+          ? {
+              oneTimePreKeyId: remote.oneTimePreKeyId,
+              oneTimePreKey: remote.oneTimePreKey,
+            }
+          : undefined
+      );
+
+      handshakeMeta = handshakeSeed;
+
+      isNewSession = true;
+      console.log('[encryptMessage] New session created');
+    } catch (error) {
+      console.error('[encryptMessage] Failed to create session:', error);
+      throw error;
     }
-
-    const handshake = await performX3DHInitiation({
-      localKeys,
-      remoteBundle: remote.bundle,
-      remoteOneTimePreKey: remote.oneTimePreKey
-        ? {
-            id: remote.oneTimePreKeyId,
-            publicKey: remote.oneTimePreKey,
-          }
-        : undefined,
-    });
-
-    if (remote.oneTimePreKeyId) {
-      await markPreKeyConsumed(remote.oneTimePreKeyId);
-    }
-
-    session = createSession(
-      { conversationId, localUserId, remoteUserId },
-      handshake.ratchetState,
-      remote.oneTimePreKey
-        ? {
-            oneTimePreKeyId: remote.oneTimePreKeyId,
-            oneTimePreKey: remote.oneTimePreKey,
-          }
-        : undefined
-    );
-
-    handshakeMeta = remote.oneTimePreKey
-      ? {
-          oneTimePreKeyId: remote.oneTimePreKeyId,
-          oneTimePreKey: remote.oneTimePreKey,
-        }
-      : undefined;
-
-    isNewSession = true;
   }
 
-  const ratchet = await DoubleRatchet.fromState(session.ratchetState);
-  const { payload, messageKey } = await ratchet.encrypt(
-    plaintext,
-    associatedData
-  );
+  try {
+    console.log('[encryptMessage] Creating double ratchet from session...');
+    const ratchet = await DoubleRatchet.fromState(session.ratchetState);
+    
+    console.log('[encryptMessage] Encrypting with double ratchet...');
+    const { payload, messageKey } = await ratchet.encrypt(
+      plaintext,
+      associatedData
+    );
+    console.log('[encryptMessage] Double ratchet encryption complete');
 
-  session.ratchetState = await ratchet.getState();
-  session.updatedAt = Date.now();
+    session.ratchetState = await ratchet.getState();
+    session.updatedAt = Date.now();
 
-  const cacheKey = buildCacheKey(payload.header);
-  const cache = session.messageKeyCache ?? {};
-  cache[cacheKey] = messageKey;
-  session.messageKeyCache = pruneCache(cache);
-  session.awaitingPreKey = null;
+    const cacheKey = buildCacheKey(payload.header);
+    const cache = session.messageKeyCache ?? {};
+    cache[cacheKey] = messageKey;
+    session.messageKeyCache = pruneCache(cache);
+    session.awaitingPreKey = null;
 
-  await saveSession(session);
+    console.log('[encryptMessage] Saving session...');
+    await saveSession(session);
+    console.log('[encryptMessage] Session saved');
 
-  const envelope: SignalEnvelope = {
-    version: ENVELOPE_VERSION,
-    header: payload.header,
-    ciphertext: payload.ciphertext,
-    associatedData: payload.associatedData,
-    handshake: isNewSession ? handshakeMeta : undefined,
-  };
+    const envelope: SignalEnvelope = {
+      version: ENVELOPE_VERSION,
+      header: payload.header,
+      ciphertext: payload.ciphertext,
+      associatedData: payload.associatedData,
+      handshake: isNewSession ? handshakeMeta : undefined,
+    };
 
-  return serialize(envelope);
+    const serialized = serialize(envelope);
+    console.log('[encryptMessage] Encryption completed successfully');
+    void trackTelemetryEvent({
+      event: 'message_encrypted',
+      conversationId,
+      actorId: localUserId,
+      meta: {
+        hasHandshake: !!envelope.handshake,
+        payloadLength: serialized.length,
+      },
+    });
+    return serialized;
+  } catch (error) {
+    console.error('[encryptMessage] Encryption failed:', error);
+    void trackTelemetryEvent({
+      event: 'message_send_error',
+      conversationId,
+      actorId: localUserId,
+      severity: 'warning',
+      meta: { reason: error instanceof Error ? error.message : 'unknown' },
+    });
+    throw error;
+  }
 }
 
 export async function decryptMessage(
   ciphertext: string,
   options: DecryptionOptions
 ): Promise<string> {
+  console.log('[decryptMessage] Starting decryption...', { 
+    conversationId: options.conversationId,
+    senderIsLocal: options.senderIsLocal 
+  });
+  
   if (!ciphertext) {
+    console.log('[decryptMessage] Empty ciphertext');
     return '';
   }
 
   const envelope = parseEnvelope(ciphertext);
   if (!envelope || envelope.version !== ENVELOPE_VERSION) {
+    console.log('[decryptMessage] Invalid envelope or version mismatch, returning as-is');
     // Legacy or plaintext message fallback.
     return ciphertext;
   }
@@ -191,26 +259,67 @@ export async function decryptMessage(
   const { conversationId, localUserId, remoteUserId, senderIsLocal } = options;
   let session = await loadSession(conversationId);
   const cache = session?.messageKeyCache ?? {};
+  
+  console.log('[decryptMessage] Session loaded:', {
+    sessionExists: !!session,
+    partnerId: session?.partnerId,
+    expectedRemoteUser: remoteUserId,
+    remoteUserMatches: session?.partnerId === remoteUserId,
+    senderIsLocal,
+    localUserId,
+    hasHandshake: !!envelope.handshake
+  });
 
   if (!session || session.partnerId !== remoteUserId) {
+    console.log('[decryptMessage] Session missing or partner mismatch, initializing new session');
+    
     if (senderIsLocal) {
+      console.log('[decryptMessage] Sender is local but no session found - returning encrypted');
       return '[encrypted]';
     }
 
+    console.log('[decryptMessage] Completing X3DH handshake as responder');
     const localKeys = await ensureDeviceKeys(localUserId);
-    const remote = await fetchRemoteDeviceBundle(remoteUserId);
 
-    if (!remote) {
-      throw new Error('Unable to locate Signal keys for sender');
+    let remote: Awaited<ReturnType<typeof fetchRemoteDeviceBundle>> = null;
+    try {
+      remote = await fetchRemoteDeviceBundle(remoteUserId);
+    } catch (bundleError) {
+      console.warn('[decryptMessage] Failed to fetch remote device bundle:', bundleError);
     }
+
+    const identityFromEnvelope = envelope.handshake?.senderIdentityKey;
+    const identityFromBundle = remote?.bundle.identityKey;
+    const initiatorIdentityKey = identityFromEnvelope ?? identityFromBundle;
+
+    if (!initiatorIdentityKey) {
+      console.error('[decryptMessage] Missing initiator identity key for handshake');
+      throw new Error('Unable to determine sender identity key for handshake');
+    }
+
+    if (
+      identityFromEnvelope &&
+      identityFromBundle &&
+      identityFromEnvelope !== identityFromBundle
+    ) {
+      console.warn(
+        '[decryptMessage] Sender identity mismatch between envelope and bundle; preferring envelope value'
+      );
+    }
+
+    console.log('[decryptMessage] Handshake identity resolved:', {
+      fromEnvelope: !!identityFromEnvelope,
+      fromBundle: !!identityFromBundle,
+    });
 
     const handshake = await completeX3DHResponse({
       localKeys,
-      initiatorIdentityKey: remote.bundle.identityKey,
+      initiatorIdentityKey,
       initiatorEphemeralKey: envelope.header.ratchetKey,
       usedOneTimePreKey: envelope.handshake?.oneTimePreKey,
     });
 
+    console.log('[decryptMessage] X3DH handshake completed, creating session');
     session = createSession(
       { conversationId, localUserId, remoteUserId },
       handshake.ratchetState,
@@ -221,11 +330,29 @@ export async function decryptMessage(
       const storedKeys = await loadDeviceKeys();
 
       if (storedKeys) {
-        storedKeys.oneTimePreKeys = storedKeys.oneTimePreKeys.filter(
-          (prekey) =>
-            prekey.publicKey !== handshake.consumedOneTimePreKey?.publicKey
+        const publicKey = handshake.consumedOneTimePreKey.publicKey;
+        const wasActive = storedKeys.oneTimePreKeys.some(
+          (prekey) => prekey.publicKey === publicKey
         );
-        await saveDeviceKeys(storedKeys);
+
+        if (wasActive) {
+          storedKeys.oneTimePreKeys = storedKeys.oneTimePreKeys.filter(
+            (prekey) => prekey.publicKey !== publicKey
+          );
+          const consumedList = storedKeys.consumedOneTimePreKeys ?? [];
+          const alreadyTracked = consumedList.some(
+            (prekey) => prekey.publicKey === publicKey
+          );
+
+          if (!alreadyTracked) {
+            storedKeys.consumedOneTimePreKeys = [
+              ...consumedList,
+              handshake.consumedOneTimePreKey,
+            ];
+          }
+
+          await saveDeviceKeys(storedKeys);
+        }
       }
     }
 
@@ -235,51 +362,129 @@ export async function decryptMessage(
   }
 
   if (!session) {
+    console.error('[decryptMessage] Session initialization failed');
     throw new Error('Session initialization failed');
   }
 
-  const ratchet = await DoubleRatchet.fromState(session.ratchetState);
-  const cacheKey = buildCacheKey(envelope.header);
-  let plaintext: string | null = null;
+  try {
+    const ratchet = await DoubleRatchet.fromState(session.ratchetState);
+    const cacheKey = buildCacheKey(envelope.header);
+    let plaintext: string | null = null;
 
-  if (senderIsLocal) {
-    const cachedMessageKey = cache[cacheKey];
+    if (senderIsLocal) {
+      console.log('[decryptMessage] Decrypting own message with cached key');
+      const cachedMessageKey = cache[cacheKey];
 
-    if (!cachedMessageKey) {
-      return '[encrypted]';
+      if (!cachedMessageKey) {
+        console.log('[decryptMessage] No cached key found for own message');
+        return '[encrypted]';
+      }
+
+      plaintext = await ratchet.decryptWithKnownKey(
+        {
+          header: envelope.header,
+          ciphertext: envelope.ciphertext,
+          associatedData: envelope.associatedData,
+        },
+        cachedMessageKey
+      );
+    } else {
+      console.log('[decryptMessage] Decrypting incoming message with ratchet');
+      const cachedMessageKey = cache[cacheKey];
+
+      if (cachedMessageKey) {
+        console.log('[decryptMessage] Using cached key for incoming message');
+        plaintext = await ratchet.decryptWithKnownKey(
+          {
+            header: envelope.header,
+            ciphertext: envelope.ciphertext,
+            associatedData: envelope.associatedData,
+          },
+          cachedMessageKey
+        );
+      } else {
+        const result = await ratchet.decryptIncoming({
+          header: envelope.header,
+          ciphertext: envelope.ciphertext,
+          associatedData: envelope.associatedData,
+        });
+
+        plaintext = result.plaintext;
+        cache[cacheKey] = result.messageKey;
+
+        if (Array.isArray(result.skippedMessageKeys)) {
+          for (const skipped of result.skippedMessageKeys) {
+            const skippedCacheKey = `${skipped.ratchetKey}:${skipped.messageNumber}`;
+            if (!cache[skippedCacheKey]) {
+              cache[skippedCacheKey] = skipped.key;
+            }
+          }
+        }
+      }
+
+      session.messageKeyCache = pruneCache(cache);
     }
 
-    plaintext = await ratchet.decryptWithKnownKey(
-      {
-        header: envelope.header,
-        ciphertext: envelope.ciphertext,
-        associatedData: envelope.associatedData,
+    session.ratchetState = await ratchet.getState();
+    session.updatedAt = Date.now();
+
+    if (!senderIsLocal) {
+      await saveSession(session);
+      console.log('[decryptMessage] Session saved after decrypting incoming message');
+    } else {
+      await saveSession({
+        ...session,
+        messageKeyCache: pruneCache(cache),
+      });
+      console.log('[decryptMessage] Session saved after decrypting own message');
+    }
+
+    console.log('[decryptMessage] Decryption successful');
+    void trackTelemetryEvent({
+      event: 'message_decrypt_success',
+      conversationId,
+      actorId: localUserId,
+      meta: {
+        senderIsLocal,
+        cipherLength: envelope.ciphertext.length,
       },
-      cachedMessageKey
-    );
-  } else {
-    const result = await ratchet.decryptIncoming({
-      header: envelope.header,
-      ciphertext: envelope.ciphertext,
-      associatedData: envelope.associatedData,
+    });
+    return plaintext;
+  } catch (error) {
+    console.warn('[decryptMessage] Unable to decrypt payload, marking as destroyed:', {
+      conversationId,
+      senderIsLocal,
+      error: error instanceof Error ? error.message : error,
     });
 
-    plaintext = result.plaintext;
-    cache[cacheKey] = result.messageKey;
-    session.messageKeyCache = pruneCache(cache);
-  }
+    if (!senderIsLocal) {
+      await deleteSession(conversationId);
+      void trackTelemetryEvent({
+        event: 'ratchet_reset',
+        conversationId,
+        actorId: localUserId,
+        severity: 'warning',
+        meta: { reason: 'decrypt_failure' },
+      });
+    }
 
-  session.ratchetState = await ratchet.getState();
-  session.updatedAt = Date.now();
-
-  if (!senderIsLocal) {
-    await saveSession(session);
-  } else {
-    await saveSession({
-      ...session,
-      messageKeyCache: pruneCache(cache),
+    void trackTelemetryEvent({
+      event: 'message_decrypt_destroyed',
+      conversationId,
+      actorId: localUserId,
+      severity: 'warning',
+      meta: { reason: error instanceof Error ? error.message : 'Unknown error' },
     });
-  }
 
-  return plaintext;
+    return DESTROYED_MESSAGE_PLACEHOLDER;
+  }
+}
+
+/**
+ * Clears the encrypted session for a conversation.
+ * Use this to reset corrupted sessions.
+ */
+export async function clearConversationSession(conversationId: string): Promise<void> {
+  console.log('[clearConversationSession] Clearing session:', conversationId);
+  await deleteSession(conversationId);
 }

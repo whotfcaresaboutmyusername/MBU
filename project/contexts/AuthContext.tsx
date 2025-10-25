@@ -94,6 +94,7 @@
 import React, { createContext, useContext, useEffect, useState } from 'react';
 import { Session } from '@supabase/supabase-js';
 import { supabase } from '@/lib/supabase';
+import { ensureDeviceKeys } from '@/lib/crypto/deviceKeys';
 
 interface AuthContextType {
   session: Session | null;
@@ -110,8 +111,23 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    supabase.auth.getSession().then(({ data: { session } }) => {
+    supabase.auth.getSession().then(async ({ data: { session } }) => {
       setSession(session);
+      
+      // If user is already logged in, ensure they have device keys
+      if (session?.user) {
+        console.log('[AuthContext] Existing session found, checking device keys...');
+        try {
+          await ensureDeviceKeys(session.user.id, 'primary', {
+            contact: session.user.email || session.user.phone || undefined,
+            displayName: session.user.email?.split('@')[0] || undefined,
+          });
+          console.log('[AuthContext] Device keys ready');
+        } catch (error) {
+          console.error('[AuthContext] Failed to ensure device keys:', error);
+        }
+      }
+      
       setLoading(false);
     });
 
@@ -120,6 +136,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         setSession(session);
 
         if (session?.user && _event === 'SIGNED_IN') {
+          console.log('[AuthContext] User signed in, initializing profile and device keys...');
+          
           const { data: profile } = await supabase
             .from('profiles')
             .select('id')
@@ -135,6 +153,19 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
               phone_number: contact,
               display_name: session.user.email?.split('@')[0] || contact,
             });
+            console.log('[AuthContext] Profile created');
+          }
+
+          // Generate and publish device keys for end-to-end encryption
+          try {
+            console.log('[AuthContext] Generating device keys...');
+            await ensureDeviceKeys(session.user.id, 'primary', {
+              contact: session.user.email || session.user.phone || undefined,
+              displayName: session.user.email?.split('@')[0] || undefined,
+            });
+            console.log('[AuthContext] Device keys generated and published');
+          } catch (error) {
+            console.error('[AuthContext] Failed to generate device keys:', error);
           }
         }
       })();

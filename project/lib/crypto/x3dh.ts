@@ -96,6 +96,7 @@ export async function generateDeviceKeys(
     signedPreKey: toKeyPair(sodium, signedPreKeyPair),
     signedPreKeySignature,
     oneTimePreKeys,
+    consumedOneTimePreKeys: [],
     deviceLabel,
   };
 
@@ -253,17 +254,28 @@ export async function completeX3DHResponse({
   ];
 
   let consumedOneTimePreKey: KeyPair | undefined;
+  let consumedPreKeyWasActive = false;
 
   if (usedOneTimePreKey) {
     consumedOneTimePreKey = localKeys.oneTimePreKeys.find(
       (prekey) => prekey.publicKey === usedOneTimePreKey
     );
 
+    if (!consumedOneTimePreKey && localKeys.consumedOneTimePreKeys?.length) {
+      consumedOneTimePreKey = localKeys.consumedOneTimePreKeys.find(
+        (prekey) => prekey.publicKey === usedOneTimePreKey
+      );
+    } else if (consumedOneTimePreKey) {
+      consumedPreKeyWasActive = true;
+    }
+
     if (consumedOneTimePreKey) {
       const privateKey = decode(sodium, consumedOneTimePreKey.privateKey);
       contributions.push(
         sodium.crypto_scalarmult(privateKey, initiatorEphemeral)
       );
+    } else if (__DEV__) {
+      console.warn('[completeX3DHResponse] Provided one-time prekey not found locally');
     }
   }
 
@@ -284,6 +296,8 @@ export async function completeX3DHResponse({
 
   return {
     ratchetState,
-    consumedOneTimePreKey,
+    consumedOneTimePreKey: consumedPreKeyWasActive
+      ? consumedOneTimePreKey
+      : undefined,
   };
 }

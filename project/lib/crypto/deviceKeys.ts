@@ -127,6 +127,24 @@ const ensureProfileExists = async (
   }
 };
 
+const normalizeStoredKeys = (
+  keys?: StoredDeviceKeys | null
+): StoredDeviceKeys | null => {
+  if (!keys) {
+    return null;
+  }
+
+  if (!Array.isArray(keys.oneTimePreKeys)) {
+    keys.oneTimePreKeys = [];
+  }
+
+  if (!Array.isArray(keys.consumedOneTimePreKeys)) {
+    keys.consumedOneTimePreKeys = [];
+  }
+
+  return keys;
+};
+
 export async function ensureDeviceKeys(
   userId: string,
   deviceLabel = 'primary',
@@ -134,12 +152,21 @@ export async function ensureDeviceKeys(
 ): Promise<StoredDeviceKeys> {
   await ensureProfileExists(userId, hint);
 
-  let keys = await loadDeviceKeys();
+  let keys = normalizeStoredKeys(await loadDeviceKeys());
 
   if (!keys || keys.deviceLabel !== deviceLabel) {
     const generated = await generateDeviceKeys(deviceLabel);
-    keys = generated;
+    keys = normalizeStoredKeys(generated);
+    if (!keys) {
+      throw new Error('Failed to generate device keys');
+    }
     await saveDeviceKeys(keys);
+  } else if (!keys.consumedOneTimePreKeys) {
+    keys.consumedOneTimePreKeys = [];
+  }
+
+  if (!keys) {
+    throw new Error('Device keys unavailable after initialization');
   }
 
   await publishDeviceKeys(userId, keys);
@@ -197,6 +224,8 @@ export async function publishDeviceKeys(
 export async function fetchRemoteDeviceBundle(
   userId: string
 ): Promise<RemoteDeviceBundle | null> {
+  console.log(`[fetchRemoteDeviceBundle] Fetching device bundle for user: ${userId}`);
+  
   const { data, error } = await supabase
     .from('user_devices')
     .select(
@@ -221,13 +250,16 @@ export async function fetchRemoteDeviceBundle(
     .maybeSingle();
 
   if (error) {
+    console.error('[fetchRemoteDeviceBundle] Database error:', error);
     throw error;
   }
 
   if (!data) {
+    console.warn(`[fetchRemoteDeviceBundle] No device keys found for user ${userId}. They need to log in to generate keys.`);
     return null;
   }
 
+  console.log('[fetchRemoteDeviceBundle] Device bundle found successfully');
   return mapRemoteBundle(data as RemoteDeviceRow);
 }
 
