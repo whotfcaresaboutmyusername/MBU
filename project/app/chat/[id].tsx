@@ -1000,7 +1000,7 @@ export default function ChatScreen() {
         {
           ...baseMessagePayload,
           sender: session.user.id,
-          recipient: otherUser.id,
+          recipient: recipientId,
         },
         { ...baseMessagePayload },
         (() => {
