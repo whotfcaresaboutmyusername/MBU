@@ -7,7 +7,8 @@ import * as x25519 from '@stablelib/x25519';
 import { HKDF } from '@stablelib/hkdf';
 import { SHA256 } from '@stablelib/sha256';
 import { XChaCha20Poly1305 } from '@stablelib/xchacha20poly1305';
-
+import * as nacl from 'tweetnacl';
+import { ed25519 as nobleEd25519 } from '@noble/curves/ed25519';
 console.log('[sodium-stable] Using @stablelib for React Native crypto operations');
 
 // Use expo-crypto for random bytes generation (reliable on React Native)
@@ -93,18 +94,24 @@ export function crypto_sign_verify_detached(
   return ed25519.verify(publicKey, message, signature);
 }
 
-// Convert Ed25519 keys to Curve25519 keys
+// Convert Ed25519 keys to Curve25519 keys  
+// These functions convert between Ed25519 (signing) and Curve25519 (key exchange)
+// This is required for the Signal protocol which derives X25519 keys from Ed25519 keys
+// Using @noble/curves which provides libsodium-compatible conversion
 export function crypto_sign_ed25519_pk_to_curve25519(ed25519PublicKey: Uint8Array): Uint8Array {
-  // Ed25519 to Curve25519 conversion
-  // For compatibility, we'll use the first 32 bytes as-is
-  // Note: This is a simplified version. Full conversion requires Montgomery curve operations.
-  return ed25519.convertPublicKeyToX25519(ed25519PublicKey);
+  // Convert Ed25519 public key to Curve25519 (Montgomery curve)
+  // This is a mathematical conversion from Edwards to Montgomery form
+  return nobleEd25519.edwardsToMontgomeryPub(ed25519PublicKey);
 }
 
 export function crypto_sign_ed25519_sk_to_curve25519(ed25519SecretKey: Uint8Array): Uint8Array {
-  // Ed25519 to Curve25519 conversion for secret key
-  // Extract the first 32 bytes (seed) from ed25519 secret key
-  return ed25519.convertSecretKeyToX25519(ed25519SecretKey);
+  // Ed25519 secret keys are 64 bytes in libsodium format: seed (32) + public key (32)
+  // Extract the seed (first 32 bytes) and hash it to get Curve25519 scalar
+  const seed = ed25519SecretKey.slice(0, 32);
+  
+  // Use @noble/curves to convert Ed25519 private key to Curve25519
+  // This does the proper SHA-512 hashing and clamping
+  return nobleEd25519.edwardsToMontgomery(seed);
 }
 
 // X25519 key exchange operations

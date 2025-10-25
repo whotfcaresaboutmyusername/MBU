@@ -14,6 +14,7 @@
   "dependencies": {
     "@expo/vector-icons": "^15.0.2",
     "@lucide/lab": "^0.1.2",
+    "@noble/curves": "^2.0.1",
     "@react-navigation/bottom-tabs": "^7.2.0",
     "@react-navigation/native": "^7.0.14",
     "@stablelib/base64": "^2.0.1",
@@ -57,7 +58,9 @@
     "react-native-web": "^0.21.0",
     "react-native-webview": "13.15.0",
     "readable-stream": "^4.7.0",
-    "supabase": "^2.53.6"
+    "supabase": "^2.53.6",
+    "tweetnacl": "^1.0.3",
+    "tweetnacl-util": "^0.15.1"
   },
   "devDependencies": {
     "@babel/core": "^7.25.2",
